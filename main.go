@@ -196,9 +196,9 @@ func initialModel(dashboardMode bool, host, community string) model {
 		community:      community,
 		prevStats:      make(map[int]InterfaceStats),
 		currentStats:   make(map[int]InterfaceStats),
-		updateInterval: 10 * time.Second,
+		updateInterval: time.Second,
 		alerts:         []string{},
-		maxHistory:     60, // 60 pontos de histórico (10 minutos a 10s cada)
+		maxHistory:     720, // buffer circular de 12 minutos com refresh de 1s
 		history:        []DataPoint{},
 		historyByIf:    make(map[int][]DataPoint),
 		historyTTL:     24 * time.Hour,
@@ -1000,8 +1000,8 @@ func (m model) viewGraph() string {
 		currentTx = formatBps(last.TxRate)
 	}
 
-	legend := fmt.Sprintf("🔵 RX: %s  |  🔴 TX: %s", currentRx, currentTx)
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render(legend))
+	legend := fmt.Sprintf("🟩 IN: %s  |  🟦 OUT: %s", currentRx, currentTx)
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#7CCF8A")).Render(legend))
 	b.WriteString("\n\n")
 
 	footer := lipgloss.NewStyle().
@@ -1020,57 +1020,55 @@ func (m model) renderGraph(speedMbps uint64) string {
 	const height = 20
 	const width = 100
 
-	// Escala dinâmica com margem visual para lembrar o estilo do btop.
-	interfaceLimit := float64(speedMbps) * 1000000 // Mbps para bps
+	interfaceLimit := float64(speedMbps) * 1000000
 	if interfaceLimit <= 0 {
 		interfaceLimit = 1000000
 	}
 
-	peak := 0.0
-	for _, p := range m.history {
-		peak = math.Max(peak, math.Max(p.RxRate, p.TxRate))
-	}
-	maxRate := math.Max(interfaceLimit*0.05, peak*1.20)
-	maxRate = math.Min(maxRate, interfaceLimit)
-
-	// Criar grid
-	grid := make([][]rune, height)
-	for i := range grid {
-		grid[i] = make([]rune, width)
-		for j := range grid[i] {
-			grid[i][j] = ' '
-		}
-	}
-
-	// Plotar dados
 	pointsToShow := len(m.history)
 	if pointsToShow > width {
 		pointsToShow = width
 	}
-
 	startIdx := len(m.history) - pointsToShow
 
 	rxSeries := make([]float64, pointsToShow)
 	txSeries := make([]float64, pointsToShow)
+	peak := 0.0
 	for i := 0; i < pointsToShow; i++ {
 		point := m.history[startIdx+i]
 		rxSeries[i] = point.RxRate
 		txSeries[i] = point.TxRate
+		peak = math.Max(peak, math.Max(point.RxRate, point.TxRate))
 	}
 
-	rxSeries = smoothSeries(rxSeries, 0.35)
-	txSeries = smoothSeries(txSeries, 0.35)
+	rxSeries = antiJitter(smoothSeries(rxSeries, 0.28), 0.03)
+	txSeries = antiJitter(smoothSeries(txSeries, 0.28), 0.03)
+
+	maxRate := math.Max(interfaceLimit*0.08, peak*1.20)
+	maxRate = math.Min(maxRate, interfaceLimit)
+
+	grid := make([][]rune, height)
+	for y := range grid {
+		grid[y] = make([]rune, width)
+		for x := range grid[y] {
+			grid[y][x] = ' '
+		}
+	}
 
 	half := height / 2
+	inPeak := 0.0
+	outPeak := 0.0
 	for x := 0; x < pointsToShow; x++ {
-		rxValue := math.Max(rxSeries[x], 0)
-		txValue := math.Max(txSeries[x], 0)
+		inValue := math.Max(rxSeries[x], 0)
+		outValue := math.Max(txSeries[x], 0)
+		inPeak = math.Max(inPeak, inValue)
+		outPeak = math.Max(outPeak, outValue)
 
-		rxUnits := int(math.Round((rxValue / maxRate) * float64(half*8)))
-		txUnits := int(math.Round((txValue / maxRate) * float64(half*8)))
+		inUnits := int(math.Round((inValue / maxRate) * float64(half*8)))
+		outUnits := int(math.Round((outValue / maxRate) * float64(half*8)))
 
-		drawBar(grid, x, half-1, -1, rxUnits, 'R')
-		drawBar(grid, x, half, 1, txUnits, 'T')
+		drawFilledBarSubpixel(grid, x, half-1, -1, inUnits, true)
+		drawFilledBarSubpixel(grid, x, half+1, 1, outUnits, false)
 	}
 
 	for x := 0; x < width; x++ {
@@ -1079,64 +1077,121 @@ func (m model) renderGraph(speedMbps uint64) string {
 		}
 	}
 
-	// Renderizar grid com bordas e escala
-	var output strings.Builder
+	if inPeak > 0 {
+		peakUnits := int(math.Round((inPeak / maxRate) * float64(half*8)))
+		peakRow := peakRowForUnits(half-1, -1, peakUnits)
+		if peakRow >= 0 && peakRow < height {
+			for x := 0; x < pointsToShow; x++ {
+				if grid[peakRow][x] == ' ' {
+					grid[peakRow][x] = 'P'
+				}
+			}
+		}
+	}
+	if outPeak > 0 {
+		peakUnits := int(math.Round((outPeak / maxRate) * float64(half*8)))
+		peakRow := peakRowForUnits(half+1, 1, peakUnits)
+		if peakRow >= 0 && peakRow < height {
+			for x := 0; x < pointsToShow; x++ {
+				if grid[peakRow][x] == ' ' {
+					grid[peakRow][x] = 'Q'
+				}
+			}
+		}
+	}
 
-	// Linha superior
+	var output strings.Builder
 	output.WriteString("┌")
 	output.WriteString(strings.Repeat("─", width))
 	output.WriteString("┐\n")
 
-	// Linhas do gráfico com escala
-	for i := 0; i < height; i++ {
-		// Escala lateral
-		percent := 100 - (i * 100 / height)
-		label := fmt.Sprintf("%3d%%", percent)
+	for y := 0; y < height; y++ {
+		label := fmt.Sprintf("%3d%%", 100-(y*100/height))
 		output.WriteString(label)
 		output.WriteString("│")
 
-		// Colorir linha
-		line := string(grid[i])
-		// RX = azul, TX = vermelho, ambos = magenta
-		line = strings.ReplaceAll(line, "R", lipgloss.NewStyle().Foreground(lipgloss.Color("#3BA1FF")).Render("█"))
-		line = strings.ReplaceAll(line, "T", lipgloss.NewStyle().Foreground(lipgloss.Color("#D34BFF")).Render("█"))
+		line := string(grid[y])
+		line = strings.ReplaceAll(line, "A", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("█"))
+		line = strings.ReplaceAll(line, "a", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▁"))
+		line = strings.ReplaceAll(line, "b", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▂"))
+		line = strings.ReplaceAll(line, "c", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▃"))
+		line = strings.ReplaceAll(line, "d", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▄"))
+		line = strings.ReplaceAll(line, "e", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▅"))
+		line = strings.ReplaceAll(line, "f", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▆"))
+		line = strings.ReplaceAll(line, "g", lipgloss.NewStyle().Foreground(lipgloss.Color("#1F6E3A")).Render("▇"))
+
+		line = strings.ReplaceAll(line, "B", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("█"))
+		line = strings.ReplaceAll(line, "h", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▁"))
+		line = strings.ReplaceAll(line, "i", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▂"))
+		line = strings.ReplaceAll(line, "j", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▃"))
+		line = strings.ReplaceAll(line, "k", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▄"))
+		line = strings.ReplaceAll(line, "l", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▅"))
+		line = strings.ReplaceAll(line, "m", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▆"))
+		line = strings.ReplaceAll(line, "n", lipgloss.NewStyle().Foreground(lipgloss.Color("#2A77D4")).Render("▇"))
+
+		line = strings.ReplaceAll(line, "P", lipgloss.NewStyle().Foreground(lipgloss.Color("#57D988")).Render("╌"))
+		line = strings.ReplaceAll(line, "Q", lipgloss.NewStyle().Foreground(lipgloss.Color("#62A7FF")).Render("╌"))
 		line = strings.ReplaceAll(line, "─", lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")).Render("─"))
 
 		output.WriteString(line)
 		output.WriteString("│\n")
 	}
 
-	// Linha inferior
 	output.WriteString("    └")
 	output.WriteString(strings.Repeat("─", width))
 	output.WriteString("┘\n")
 
-	// Eixo de tempo
-	timeLabel := fmt.Sprintf("     ← %d segundos atrás", len(m.history)*10)
+	historySpan := int(float64(len(m.history)) * m.updateInterval.Seconds())
+	timeLabel := fmt.Sprintf("     ← %d segundos atrás", historySpan)
 	output.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render(timeLabel))
-	output.WriteString(strings.Repeat(" ", width-len(timeLabel)-10))
+	output.WriteString(strings.Repeat(" ", maxInt(0, width-len(timeLabel)-10)))
 	output.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("agora →"))
 
 	return output.String()
 }
 
-func drawBar(grid [][]rune, x int, startRow int, direction int, units int, marker rune) {
+func drawFilledBarSubpixel(grid [][]rune, x int, startRow int, direction int, units int, inbound bool) {
 	if len(grid) == 0 || x < 0 || x >= len(grid[0]) || units <= 0 {
 		return
 	}
 
-	height := len(grid)
-	filled := units
-	for step := 0; filled > 0; step++ {
-		row := startRow + (step * direction)
-		if row < 0 || row >= height {
-			break
-		}
-		if filled > 0 {
-			grid[row][x] = marker
-		}
-		filled -= 8
+	fullRows := units / 8
+	remainder := units % 8
+	marker := 'A'
+	if !inbound {
+		marker = 'B'
 	}
+
+	for step := 0; step < fullRows; step++ {
+		row := startRow + (step * direction)
+		if row < 0 || row >= len(grid) {
+			return
+		}
+		grid[row][x] = marker
+	}
+
+	if remainder > 0 {
+		row := startRow + (fullRows * direction)
+		if row < 0 || row >= len(grid) {
+			return
+		}
+		if inbound {
+			grid[row][x] = rune('a' + remainder - 1)
+		} else {
+			grid[row][x] = rune('h' + remainder - 1)
+		}
+	}
+}
+
+func peakRowForUnits(startRow int, direction int, units int) int {
+	if units <= 0 {
+		return startRow
+	}
+	fullRows := units / 8
+	if units%8 != 0 {
+		return startRow + (fullRows * direction)
+	}
+	return startRow + ((fullRows - 1) * direction)
 }
 
 // Funções auxiliares
@@ -1223,48 +1278,28 @@ func smoothSeries(series []float64, alpha float64) []float64 {
 	return out
 }
 
-func drawSeriesLine(grid [][]rune, x0 int, y0Value float64, x1 int, y1Value float64, maxRate float64, symbol rune) {
-	height := len(grid)
-	if height == 0 {
-		return
+func antiJitter(series []float64, deadbandRatio float64) []float64 {
+	if len(series) == 0 {
+		return series
 	}
-	width := len(grid[0])
-	y0 := rateToY(y0Value, maxRate, height)
-	y1 := rateToY(y1Value, maxRate, height)
-	dx := x1 - x0
-	if dx <= 0 {
-		setGraphPoint(grid, x0, y0, symbol, width, height)
-		return
+	out := make([]float64, len(series))
+	out[0] = series[0]
+	for i := 1; i < len(series); i++ {
+		baseline := math.Max(out[i-1], 1)
+		if math.Abs(series[i]-out[i-1])/baseline < deadbandRatio {
+			out[i] = out[i-1]
+			continue
+		}
+		out[i] = series[i]
 	}
-
-	for step := 0; step <= dx; step++ {
-		t := float64(step) / float64(dx)
-		x := x0 + step
-		y := int(math.Round(float64(y0) + t*float64(y1-y0)))
-		setGraphPoint(grid, x, y, symbol, width, height)
-	}
+	return out
 }
 
-func setGraphPoint(grid [][]rune, x, y int, symbol rune, width, height int) {
-	if x < 0 || x >= width || y < 0 || y >= height {
-		return
+func maxInt(a, b int) int {
+	if a > b {
+		return a
 	}
-	if grid[y][x] != ' ' && grid[y][x] != symbol {
-		grid[y][x] = '▓'
-		return
-	}
-	grid[y][x] = symbol
-}
-
-func rateToY(rate, maxRate float64, height int) int {
-	if maxRate <= 0 {
-		return height - 1
-	}
-	if rate < 0 {
-		rate = 0
-	}
-	percent := math.Min(rate/maxRate, 1)
-	return height - 1 - int(percent*float64(height-1))
+	return b
 }
 
 func toBigInt(value interface{}) *big.Int {
