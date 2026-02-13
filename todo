@@ -1,0 +1,13 @@
+panic: interface conversion: interface {} is int, not []uint8
+
+goroutine 9878 [running]:
+main.model.getInterfaceStatsForSwitch({0x0, {{0x0, 0x0, 0x0}}, 0x1, {0x7ffc0544b608, 0xc}, {0x7ffc0544b615, 0x8}, {0x0, ...}, ...}, ...)
+	/home/willian_pires/Programas/SnmpPortView/main.go:464 +0xd05
+main.model.getInterfaceStats(...)
+	/home/willian_pires/Programas/SnmpPortView/main.go:520
+main.model.fetchData({0x0, {{0x0, 0x0, 0x0}}, 0x1, {0x7ffc0544b608, 0xc}, {0x7ffc0544b615, 0x8}, {0x0, ...}, ...})
+	/home/willian_pires/Programas/SnmpPortView/main.go:379 +0x2fb
+github.com/charmbracelet/bubbletea.(*Program).handleCommands.func1.1()
+	/home/willian_pires/go/pkg/mod/github.com/charmbracelet/bubbletea@v0.25.0/tea.go:294 +0x29
+created by github.com/charmbracelet/bubbletea.(*Program).handleCommands.func1 in goroutine 24
+	/home/willian_pires/go/pkg/mod/github.com/charmbracelet/bubbletea@v0.25.0/tea.go:293 +0x131
