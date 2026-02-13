@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"math"
+	"math/big"
 	"os"
 	"sort"
 	"strings"
@@ -300,6 +302,12 @@ func tickCmd(d time.Duration) tea.Cmd {
 }
 
 func (m model) fetchDashboardData() tea.Msg {
+	defer func() {
+		if r := recover(); r != nil {
+			m.err = fmt.Errorf("panic durante coleta do dashboard: %v", r)
+		}
+	}()
+
 	var summaries []SwitchSummary
 
 	for _, sw := range m.config.Switches {
@@ -329,7 +337,7 @@ func (m model) fetchDashboardData() tea.Msg {
 		// Obter uptime
 		result, err := snmp.Get([]string{oidSysUpTime})
 		if err == nil && len(result.Variables) > 0 {
-			ticks := result.Variables[0].Value.(uint32)
+			ticks := toUint32(result.Variables[0].Value)
 			summary.Uptime = formatUptime(ticks)
 		}
 
@@ -351,6 +359,12 @@ func (m model) fetchDashboardData() tea.Msg {
 }
 
 func (m model) fetchData() tea.Msg {
+	defer func() {
+		if r := recover(); r != nil {
+			m.err = fmt.Errorf("panic durante coleta SNMP: %v", r)
+		}
+	}()
+
 	// Conectar ao switch
 	if err := m.snmp.Connect(); err != nil {
 		return err
@@ -360,13 +374,13 @@ func (m model) fetchData() tea.Msg {
 	// Obter nome do sistema
 	result, err := m.snmp.Get([]string{oidSysName})
 	if err == nil && len(result.Variables) > 0 {
-		m.sysName = string(result.Variables[0].Value.([]byte))
+		m.sysName = toString(result.Variables[0].Value)
 	}
 
 	// Obter uptime
 	result, err = m.snmp.Get([]string{oidSysUpTime})
 	if err == nil && len(result.Variables) > 0 {
-		ticks := result.Variables[0].Value.(uint32)
+		ticks := toUint32(result.Variables[0].Value)
 		m.uptime = formatUptime(ticks)
 	}
 
@@ -393,7 +407,7 @@ func (m model) getInterfacesForSwitch(snmp *gosnmp.GoSNMP) []int {
 
 	err := snmp.Walk(oidIfIndex, func(pdu gosnmp.SnmpPDU) error {
 		if pdu.Value != nil {
-			allInterfaces = append(allInterfaces, pdu.Value.(int))
+			allInterfaces = append(allInterfaces, toInt(pdu.Value))
 		}
 		return nil
 	})
@@ -416,8 +430,8 @@ func (m model) getInterfacesForSwitch(snmp *gosnmp.GoSNMP) []int {
 		}
 		result, err := snmp.Get(oids)
 		if err == nil && len(result.Variables) == 2 {
-			ifType := result.Variables[0].Value.(int)
-			ifAdminStatus := result.Variables[1].Value.(int)
+			ifType := toInt(result.Variables[0].Value)
+			ifAdminStatus := toInt(result.Variables[1].Value)
 
 			if allowedTypes[ifType] && ifAdminStatus == 1 {
 				filteredInterfaces = append(filteredInterfaces, ifIndex)
@@ -461,54 +475,47 @@ func (m model) getInterfaceStatsForSwitch(snmp *gosnmp.GoSNMP, ifIndex int) Inte
 		switch i {
 		case 0:
 			if variable.Value != nil {
-				stat.Description = string(variable.Value.([]byte))
+				stat.Description = toString(variable.Value)
 			}
 		case 1:
 			if variable.Value != nil {
-				stat.Name = string(variable.Value.([]byte))
+				stat.Name = toString(variable.Value)
 			}
 		case 2:
 			if variable.Value != nil {
-				switch v := variable.Value.(type) {
-				case []byte:
-					if len(v) > 0 {
-						stat.Alias = string(v)
-					}
-				case string:
-					stat.Alias = v
-				}
+				stat.Alias = toString(variable.Value)
 			}
 		case 3:
 			if variable.Value != nil {
-				stat.Type = variable.Value.(int)
+				stat.Type = toInt(variable.Value)
 			}
 		case 4:
 			if variable.Value != nil {
-				stat.Speed = uint64(variable.Value.(uint))
+				stat.Speed = toUint64(variable.Value)
 			}
 		case 5:
 			if variable.Value != nil {
-				stat.InOctets = variable.Value.(uint64)
+				stat.InOctets = toUint64(variable.Value)
 			}
 		case 6:
 			if variable.Value != nil {
-				stat.OutOctets = variable.Value.(uint64)
+				stat.OutOctets = toUint64(variable.Value)
 			}
 		case 7:
 			if variable.Value != nil {
-				stat.InErrors = uint64(variable.Value.(uint))
+				stat.InErrors = toUint64(variable.Value)
 			}
 		case 8:
 			if variable.Value != nil {
-				stat.OutErrors = uint64(variable.Value.(uint))
+				stat.OutErrors = toUint64(variable.Value)
 			}
 		case 9:
 			if variable.Value != nil {
-				stat.AdminStatus = variable.Value.(int)
+				stat.AdminStatus = toInt(variable.Value)
 			}
 		case 10:
 			if variable.Value != nil {
-				stat.OperStatus = variable.Value.(int)
+				stat.OperStatus = toInt(variable.Value)
 			}
 		}
 	}
@@ -549,18 +556,18 @@ func (m *model) calculateMetrics() []InterfaceMetrics {
 		if prev, ok := m.prevStats[ifIndex]; ok {
 			timeDiff := current.Timestamp.Sub(prev.Timestamp).Seconds()
 			if timeDiff > 0 {
-				rxBytes := float64(current.InOctets - prev.InOctets)
+				rxBytes := float64(counterDelta(current.InOctets, prev.InOctets))
 				rxRate := (rxBytes * 8) / timeDiff
 				metric.RxRate = formatBps(rxRate)
 				metric.RxRateBps = rxRate
 
-				txBytes := float64(current.OutOctets - prev.OutOctets)
+				txBytes := float64(counterDelta(current.OutOctets, prev.OutOctets))
 				txRate := (txBytes * 8) / timeDiff
 				metric.TxRate = formatBps(txRate)
 				metric.TxRateBps = txRate
 
-				inErr := float64(current.InErrors - prev.InErrors)
-				outErr := float64(current.OutErrors - prev.OutErrors)
+				inErr := float64(counterDelta(current.InErrors, prev.InErrors))
+				outErr := float64(counterDelta(current.OutErrors, prev.OutErrors))
 				errorRate := (inErr + outErr) / timeDiff
 				metric.ErrorRate = fmt.Sprintf("%.2f", errorRate)
 
@@ -902,8 +909,18 @@ func (m model) renderGraph(speedMbps uint64) string {
 	const height = 20
 	const width = 100
 
-	// Calcular escala baseada na velocidade da porta
-	maxRate := float64(speedMbps) * 1000000 // Mbps para bps
+	// Escala dinâmica para aumentar fluidez visual sem estourar a velocidade real
+	interfaceLimit := float64(speedMbps) * 1000000 // Mbps para bps
+	if interfaceLimit <= 0 {
+		interfaceLimit = 1000000
+	}
+
+	peak := 0.0
+	for _, p := range m.history {
+		peak = math.Max(peak, math.Max(p.RxRate, p.TxRate))
+	}
+	maxRate := math.Max(interfaceLimit*0.1, peak*1.15)
+	maxRate = math.Min(maxRate, interfaceLimit)
 
 	// Criar grid
 	grid := make([][]rune, height)
@@ -922,27 +939,20 @@ func (m model) renderGraph(speedMbps uint64) string {
 
 	startIdx := len(m.history) - pointsToShow
 
+	rxSeries := make([]float64, pointsToShow)
+	txSeries := make([]float64, pointsToShow)
 	for i := 0; i < pointsToShow; i++ {
 		point := m.history[startIdx+i]
-		x := i
+		rxSeries[i] = point.RxRate
+		txSeries[i] = point.TxRate
+	}
 
-		// RX (azul)
-		rxPercent := point.RxRate / maxRate
-		rxY := height - 1 - int(rxPercent*float64(height-1))
-		if rxY >= 0 && rxY < height && x < width {
-			grid[rxY][x] = '█'
-		}
+	rxSeries = smoothSeries(rxSeries, 0.35)
+	txSeries = smoothSeries(txSeries, 0.35)
 
-		// TX (vermelho) - ligeiramente offset
-		txPercent := point.TxRate / maxRate
-		txY := height - 1 - int(txPercent*float64(height-1))
-		if txY >= 0 && txY < height && x < width {
-			if grid[txY][x] == '█' {
-				grid[txY][x] = '▓' // Ambos
-			} else {
-				grid[txY][x] = '▒' // TX
-			}
-		}
+	for i := 1; i < pointsToShow; i++ {
+		drawSeriesLine(grid, i-1, rxSeries[i-1], i, rxSeries[i], maxRate, '█')
+		drawSeriesLine(grid, i-1, txSeries[i-1], i, txSeries[i], maxRate, '▒')
 	}
 
 	// Renderizar grid com bordas e escala
@@ -964,7 +974,7 @@ func (m model) renderGraph(speedMbps uint64) string {
 		// Colorir linha
 		line := string(grid[i])
 		// RX = azul, TX = vermelho, ambos = magenta
-		line = strings.ReplaceAll(line, "█", lipgloss.NewStyle().Foreground(lipgloss.Color("#0000FF")).Render("█"))
+		line = strings.ReplaceAll(line, "█", lipgloss.NewStyle().Foreground(lipgloss.Color("#00A2FF")).Render("█"))
 		line = strings.ReplaceAll(line, "▒", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("▒"))
 		line = strings.ReplaceAll(line, "▓", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF00FF")).Render("▓"))
 
@@ -1058,8 +1068,133 @@ func truncateString(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
+func smoothSeries(series []float64, alpha float64) []float64 {
+	if len(series) == 0 {
+		return series
+	}
+	out := make([]float64, len(series))
+	out[0] = series[0]
+	for i := 1; i < len(series); i++ {
+		out[i] = alpha*series[i] + (1-alpha)*out[i-1]
+	}
+	return out
+}
+
+func drawSeriesLine(grid [][]rune, x0 int, y0Value float64, x1 int, y1Value float64, maxRate float64, symbol rune) {
+	height := len(grid)
+	if height == 0 {
+		return
+	}
+	width := len(grid[0])
+	y0 := rateToY(y0Value, maxRate, height)
+	y1 := rateToY(y1Value, maxRate, height)
+	dx := x1 - x0
+	if dx <= 0 {
+		setGraphPoint(grid, x0, y0, symbol, width, height)
+		return
+	}
+
+	for step := 0; step <= dx; step++ {
+		t := float64(step) / float64(dx)
+		x := x0 + step
+		y := int(math.Round(float64(y0) + t*float64(y1-y0)))
+		setGraphPoint(grid, x, y, symbol, width, height)
+	}
+}
+
+func setGraphPoint(grid [][]rune, x, y int, symbol rune, width, height int) {
+	if x < 0 || x >= width || y < 0 || y >= height {
+		return
+	}
+	if grid[y][x] != ' ' && grid[y][x] != symbol {
+		grid[y][x] = '▓'
+		return
+	}
+	grid[y][x] = symbol
+}
+
+func rateToY(rate, maxRate float64, height int) int {
+	if maxRate <= 0 {
+		return height - 1
+	}
+	if rate < 0 {
+		rate = 0
+	}
+	percent := math.Min(rate/maxRate, 1)
+	return height - 1 - int(percent*float64(height-1))
+}
+
+func toBigInt(value interface{}) *big.Int {
+	if value == nil {
+		return big.NewInt(0)
+	}
+	if v := gosnmp.ToBigInt(value); v != nil {
+		return v
+	}
+	return big.NewInt(0)
+}
+
+func toUint64(value interface{}) uint64 {
+	v := toBigInt(value)
+	if v.Sign() < 0 {
+		return 0
+	}
+	return v.Uint64()
+}
+
+func toUint32(value interface{}) uint32 {
+	return uint32(toUint64(value))
+}
+
+func toInt(value interface{}) int {
+	return int(toUint64(value))
+}
+
+func toString(value interface{}) string {
+	switch v := value.(type) {
+	case []byte:
+		return string(v)
+	case string:
+		return v
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func counterDelta(current, previous uint64) uint64 {
+	if current >= previous {
+		return current - previous
+	}
+	return 0
+}
+
+func promptForTarget(reader *bufio.Reader) (string, string, error) {
+	fmt.Print("Host/IP do switch: ")
+	host, err := reader.ReadString('\n')
+	if err != nil {
+		return "", "", err
+	}
+
+	fmt.Print("Community SNMP: ")
+	community, err := reader.ReadString('\n')
+	if err != nil {
+		return "", "", err
+	}
+
+	host = strings.TrimSpace(host)
+	community = strings.TrimSpace(community)
+
+	if host == "" || community == "" {
+		return "", "", fmt.Errorf("host e community são obrigatórios")
+	}
+
+	return host, community, nil
+}
+
 func main() {
 	dashboardMode := flag.Bool("d", false, "Dashboard mode - load switches from switches.json")
+	hostFlag := flag.String("host", "", "Host/IP do switch")
+	communityFlag := flag.String("community", "", "Community SNMP")
 	flag.Parse()
 
 	var m model
@@ -1067,19 +1202,18 @@ func main() {
 	if *dashboardMode {
 		m = initialModel(true, "", "")
 	} else {
-		if len(os.Args) < 3 {
-			fmt.Println("Uso:")
-			fmt.Println("  Modo normal:    switch-monitor <host> <community>")
-			fmt.Println("  Modo dashboard: switch-monitor -d")
-			fmt.Println("")
-			fmt.Println("Exemplos:")
-			fmt.Println("  switch-monitor 192.168.1.1 public")
-			fmt.Println("  switch-monitor -d")
-			os.Exit(1)
-		}
+		host := strings.TrimSpace(*hostFlag)
+		community := strings.TrimSpace(*communityFlag)
 
-		host := os.Args[1]
-		community := os.Args[2]
+		if host == "" || community == "" {
+			reader := bufio.NewReader(os.Stdin)
+			var err error
+			host, community, err = promptForTarget(reader)
+			if err != nil {
+				fmt.Printf("Erro ao ler host/community: %v\n", err)
+				os.Exit(1)
+			}
+		}
 		m = initialModel(false, host, community)
 	}
 
