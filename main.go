@@ -9,7 +9,9 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -132,6 +134,10 @@ type DataPoint struct {
 	TxRate    float64
 }
 
+type persistedHistory struct {
+	Hosts map[string]map[string][]DataPoint `json:"hosts"`
+}
+
 type tickMsg time.Time
 
 type model struct {
@@ -162,7 +168,11 @@ type model struct {
 	// Gráfico
 	selectedIfIndex int
 	history         []DataPoint
+	historyByIf     map[int][]DataPoint
 	maxHistory      int
+	historyPath     string
+	historyTTL      time.Duration
+	persisted       persistedHistory
 
 	// Sistema
 	err            error
@@ -190,7 +200,13 @@ func initialModel(dashboardMode bool, host, community string) model {
 		alerts:         []string{},
 		maxHistory:     60, // 60 pontos de histórico (10 minutos a 10s cada)
 		history:        []DataPoint{},
+		historyByIf:    make(map[int][]DataPoint),
+		historyTTL:     24 * time.Hour,
+		historyPath:    filepath.Join(".", "snmpview_history.json"),
+		persisted:      persistedHistory{Hosts: make(map[string]map[string][]DataPoint)},
 	}
+
+	m.loadPersistedHistory()
 
 	if dashboardMode {
 		m.currentView = ViewDashboard
@@ -233,6 +249,7 @@ func initialModel(dashboardMode bool, host, community string) model {
 	} else {
 		m.currentView = ViewInterfaces
 		m.setupSNMP(host, community)
+		m.hydrateHostHistory(host)
 	}
 
 	// Configurar tabela de interfaces
@@ -272,6 +289,7 @@ func initialModel(dashboardMode bool, host, community string) model {
 func (m *model) setupSNMP(host, community string) {
 	m.host = host
 	m.community = community
+	m.hydrateHostHistory(host)
 	m.snmp = &gosnmp.GoSNMP{
 		Target:    host,
 		Port:      161,
@@ -280,6 +298,92 @@ func (m *model) setupSNMP(host, community string) {
 		Timeout:   time.Duration(5) * time.Second,
 		Retries:   2,
 	}
+}
+
+func (m *model) loadPersistedHistory() {
+	data, err := os.ReadFile(m.historyPath)
+	if err != nil {
+		return
+	}
+
+	var persisted persistedHistory
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return
+	}
+	if persisted.Hosts == nil {
+		persisted.Hosts = make(map[string]map[string][]DataPoint)
+	}
+	m.persisted = persisted
+}
+
+func (m *model) hydrateHostHistory(host string) {
+	m.historyByIf = make(map[int][]DataPoint)
+	if host == "" || m.persisted.Hosts == nil {
+		return
+	}
+
+	hostHistory, ok := m.persisted.Hosts[host]
+	if !ok {
+		return
+	}
+
+	cutoff := time.Now().Add(-m.historyTTL)
+	for ifIndex, points := range hostHistory {
+		idx, err := strconv.Atoi(ifIndex)
+		if err != nil {
+			continue
+		}
+		pruned := pruneHistory(points, cutoff)
+		if len(pruned) > 0 {
+			m.historyByIf[idx] = pruned
+		}
+	}
+}
+
+func (m *model) persistCurrentHostHistory() {
+	if m.host == "" {
+		return
+	}
+	if m.persisted.Hosts == nil {
+		m.persisted.Hosts = make(map[string]map[string][]DataPoint)
+	}
+	if _, ok := m.persisted.Hosts[m.host]; !ok {
+		m.persisted.Hosts[m.host] = make(map[string][]DataPoint)
+	}
+
+	cutoff := time.Now().Add(-m.historyTTL)
+	m.persisted.Hosts[m.host] = make(map[string][]DataPoint)
+	for ifIndex, points := range m.historyByIf {
+		pruned := pruneHistory(points, cutoff)
+		if len(pruned) == 0 {
+			continue
+		}
+		m.historyByIf[ifIndex] = pruned
+		m.persisted.Hosts[m.host][strconv.Itoa(ifIndex)] = pruned
+	}
+
+	encoded, err := json.MarshalIndent(m.persisted, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(m.historyPath, encoded, 0o644)
+}
+
+func pruneHistory(points []DataPoint, cutoff time.Time) []DataPoint {
+	if len(points) == 0 {
+		return points
+	}
+	firstValid := 0
+	for i, p := range points {
+		if p.Timestamp.After(cutoff) {
+			firstValid = i
+			break
+		}
+		if i == len(points)-1 {
+			return []DataPoint{}
+		}
+	}
+	return points[firstValid:]
 }
 
 func (m model) Init() tea.Cmd {
@@ -530,6 +634,7 @@ func (m model) getInterfaceStats(ifIndex int) InterfaceStats {
 func (m *model) calculateMetrics() []InterfaceMetrics {
 	var metrics []InterfaceMetrics
 	m.alerts = []string{}
+	historyChanged := false
 
 	var indices []int
 	for ifIndex := range m.currentStats {
@@ -594,22 +699,25 @@ func (m *model) calculateMetrics() []InterfaceMetrics {
 				}
 
 				// Adicionar ao histórico se esta interface está selecionada e estamos na view de gráfico
-				if m.currentView == ViewGraph && ifIndex == m.selectedIfIndex {
-					m.history = append(m.history, DataPoint{
-						Timestamp: time.Now(),
-						RxRate:    rxRate,
-						TxRate:    txRate,
-					})
-
-					// Manter apenas maxHistory pontos
-					if len(m.history) > m.maxHistory {
-						m.history = m.history[len(m.history)-m.maxHistory:]
-					}
-				}
+				point := DataPoint{Timestamp: time.Now(), RxRate: rxRate, TxRate: txRate}
+				history := append(m.historyByIf[ifIndex], point)
+				m.historyByIf[ifIndex] = pruneHistory(history, time.Now().Add(-m.historyTTL))
+				historyChanged = true
 			}
 		}
 
 		metrics = append(metrics, metric)
+	}
+
+	if historyChanged {
+		m.persistCurrentHostHistory()
+	}
+
+	if m.currentView == ViewGraph {
+		m.history = append([]DataPoint(nil), m.historyByIf[m.selectedIfIndex]...)
+		if len(m.history) > m.maxHistory {
+			m.history = m.history[len(m.history)-m.maxHistory:]
+		}
 	}
 
 	return metrics
@@ -672,7 +780,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if selectedIdx < len(metrics) {
 					m.selectedIfIndex = metrics[selectedIdx].Index
 					m.currentView = ViewGraph
-					m.history = []DataPoint{} // Iniciar novo histórico
+					m.history = append([]DataPoint(nil), m.historyByIf[m.selectedIfIndex]...)
+					if len(m.history) > m.maxHistory {
+						m.history = m.history[len(m.history)-m.maxHistory:]
+					}
 					return m, nil
 				}
 			}
@@ -909,7 +1020,7 @@ func (m model) renderGraph(speedMbps uint64) string {
 	const height = 20
 	const width = 100
 
-	// Escala dinâmica para aumentar fluidez visual sem estourar a velocidade real
+	// Escala dinâmica com margem visual para lembrar o estilo do btop.
 	interfaceLimit := float64(speedMbps) * 1000000 // Mbps para bps
 	if interfaceLimit <= 0 {
 		interfaceLimit = 1000000
@@ -919,7 +1030,7 @@ func (m model) renderGraph(speedMbps uint64) string {
 	for _, p := range m.history {
 		peak = math.Max(peak, math.Max(p.RxRate, p.TxRate))
 	}
-	maxRate := math.Max(interfaceLimit*0.1, peak*1.15)
+	maxRate := math.Max(interfaceLimit*0.05, peak*1.20)
 	maxRate = math.Min(maxRate, interfaceLimit)
 
 	// Criar grid
@@ -950,9 +1061,22 @@ func (m model) renderGraph(speedMbps uint64) string {
 	rxSeries = smoothSeries(rxSeries, 0.35)
 	txSeries = smoothSeries(txSeries, 0.35)
 
-	for i := 1; i < pointsToShow; i++ {
-		drawSeriesLine(grid, i-1, rxSeries[i-1], i, rxSeries[i], maxRate, '█')
-		drawSeriesLine(grid, i-1, txSeries[i-1], i, txSeries[i], maxRate, '▒')
+	half := height / 2
+	for x := 0; x < pointsToShow; x++ {
+		rxValue := math.Max(rxSeries[x], 0)
+		txValue := math.Max(txSeries[x], 0)
+
+		rxUnits := int(math.Round((rxValue / maxRate) * float64(half*8)))
+		txUnits := int(math.Round((txValue / maxRate) * float64(half*8)))
+
+		drawBar(grid, x, half-1, -1, rxUnits, 'R')
+		drawBar(grid, x, half, 1, txUnits, 'T')
+	}
+
+	for x := 0; x < width; x++ {
+		if grid[half][x] == ' ' {
+			grid[half][x] = '─'
+		}
 	}
 
 	// Renderizar grid com bordas e escala
@@ -974,9 +1098,9 @@ func (m model) renderGraph(speedMbps uint64) string {
 		// Colorir linha
 		line := string(grid[i])
 		// RX = azul, TX = vermelho, ambos = magenta
-		line = strings.ReplaceAll(line, "█", lipgloss.NewStyle().Foreground(lipgloss.Color("#00A2FF")).Render("█"))
-		line = strings.ReplaceAll(line, "▒", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("▒"))
-		line = strings.ReplaceAll(line, "▓", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF00FF")).Render("▓"))
+		line = strings.ReplaceAll(line, "R", lipgloss.NewStyle().Foreground(lipgloss.Color("#3BA1FF")).Render("█"))
+		line = strings.ReplaceAll(line, "T", lipgloss.NewStyle().Foreground(lipgloss.Color("#D34BFF")).Render("█"))
+		line = strings.ReplaceAll(line, "─", lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")).Render("─"))
 
 		output.WriteString(line)
 		output.WriteString("│\n")
@@ -994,6 +1118,25 @@ func (m model) renderGraph(speedMbps uint64) string {
 	output.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("agora →"))
 
 	return output.String()
+}
+
+func drawBar(grid [][]rune, x int, startRow int, direction int, units int, marker rune) {
+	if len(grid) == 0 || x < 0 || x >= len(grid[0]) || units <= 0 {
+		return
+	}
+
+	height := len(grid)
+	filled := units
+	for step := 0; filled > 0; step++ {
+		row := startRow + (step * direction)
+		if row < 0 || row >= height {
+			break
+		}
+		if filled > 0 {
+			grid[row][x] = marker
+		}
+		filled -= 8
+	}
 }
 
 // Funções auxiliares
