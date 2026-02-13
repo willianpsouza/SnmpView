@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"math"
+	"math/big"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,6 +134,10 @@ type DataPoint struct {
 	TxRate    float64
 }
 
+type persistedHistory struct {
+	Hosts map[string]map[string][]DataPoint `json:"hosts"`
+}
+
 type tickMsg time.Time
 
 type model struct {
@@ -160,7 +168,11 @@ type model struct {
 	// Gráfico
 	selectedIfIndex int
 	history         []DataPoint
+	historyByIf     map[int][]DataPoint
 	maxHistory      int
+	historyPath     string
+	historyTTL      time.Duration
+	persisted       persistedHistory
 
 	// Sistema
 	err            error
@@ -188,7 +200,13 @@ func initialModel(dashboardMode bool, host, community string) model {
 		alerts:         []string{},
 		maxHistory:     60, // 60 pontos de histórico (10 minutos a 10s cada)
 		history:        []DataPoint{},
+		historyByIf:    make(map[int][]DataPoint),
+		historyTTL:     24 * time.Hour,
+		historyPath:    filepath.Join(".", "snmpview_history.json"),
+		persisted:      persistedHistory{Hosts: make(map[string]map[string][]DataPoint)},
 	}
+
+	m.loadPersistedHistory()
 
 	if dashboardMode {
 		m.currentView = ViewDashboard
@@ -231,6 +249,7 @@ func initialModel(dashboardMode bool, host, community string) model {
 	} else {
 		m.currentView = ViewInterfaces
 		m.setupSNMP(host, community)
+		m.hydrateHostHistory(host)
 	}
 
 	// Configurar tabela de interfaces
@@ -270,6 +289,7 @@ func initialModel(dashboardMode bool, host, community string) model {
 func (m *model) setupSNMP(host, community string) {
 	m.host = host
 	m.community = community
+	m.hydrateHostHistory(host)
 	m.snmp = &gosnmp.GoSNMP{
 		Target:    host,
 		Port:      161,
@@ -278,6 +298,92 @@ func (m *model) setupSNMP(host, community string) {
 		Timeout:   time.Duration(5) * time.Second,
 		Retries:   2,
 	}
+}
+
+func (m *model) loadPersistedHistory() {
+	data, err := os.ReadFile(m.historyPath)
+	if err != nil {
+		return
+	}
+
+	var persisted persistedHistory
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return
+	}
+	if persisted.Hosts == nil {
+		persisted.Hosts = make(map[string]map[string][]DataPoint)
+	}
+	m.persisted = persisted
+}
+
+func (m *model) hydrateHostHistory(host string) {
+	m.historyByIf = make(map[int][]DataPoint)
+	if host == "" || m.persisted.Hosts == nil {
+		return
+	}
+
+	hostHistory, ok := m.persisted.Hosts[host]
+	if !ok {
+		return
+	}
+
+	cutoff := time.Now().Add(-m.historyTTL)
+	for ifIndex, points := range hostHistory {
+		idx, err := strconv.Atoi(ifIndex)
+		if err != nil {
+			continue
+		}
+		pruned := pruneHistory(points, cutoff)
+		if len(pruned) > 0 {
+			m.historyByIf[idx] = pruned
+		}
+	}
+}
+
+func (m *model) persistCurrentHostHistory() {
+	if m.host == "" {
+		return
+	}
+	if m.persisted.Hosts == nil {
+		m.persisted.Hosts = make(map[string]map[string][]DataPoint)
+	}
+	if _, ok := m.persisted.Hosts[m.host]; !ok {
+		m.persisted.Hosts[m.host] = make(map[string][]DataPoint)
+	}
+
+	cutoff := time.Now().Add(-m.historyTTL)
+	m.persisted.Hosts[m.host] = make(map[string][]DataPoint)
+	for ifIndex, points := range m.historyByIf {
+		pruned := pruneHistory(points, cutoff)
+		if len(pruned) == 0 {
+			continue
+		}
+		m.historyByIf[ifIndex] = pruned
+		m.persisted.Hosts[m.host][strconv.Itoa(ifIndex)] = pruned
+	}
+
+	encoded, err := json.MarshalIndent(m.persisted, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(m.historyPath, encoded, 0o644)
+}
+
+func pruneHistory(points []DataPoint, cutoff time.Time) []DataPoint {
+	if len(points) == 0 {
+		return points
+	}
+	firstValid := 0
+	for i, p := range points {
+		if p.Timestamp.After(cutoff) {
+			firstValid = i
+			break
+		}
+		if i == len(points)-1 {
+			return []DataPoint{}
+		}
+	}
+	return points[firstValid:]
 }
 
 func (m model) Init() tea.Cmd {
@@ -300,6 +406,12 @@ func tickCmd(d time.Duration) tea.Cmd {
 }
 
 func (m model) fetchDashboardData() tea.Msg {
+	defer func() {
+		if r := recover(); r != nil {
+			m.err = fmt.Errorf("panic durante coleta do dashboard: %v", r)
+		}
+	}()
+
 	var summaries []SwitchSummary
 
 	for _, sw := range m.config.Switches {
@@ -329,7 +441,7 @@ func (m model) fetchDashboardData() tea.Msg {
 		// Obter uptime
 		result, err := snmp.Get([]string{oidSysUpTime})
 		if err == nil && len(result.Variables) > 0 {
-			ticks := result.Variables[0].Value.(uint32)
+			ticks := toUint32(result.Variables[0].Value)
 			summary.Uptime = formatUptime(ticks)
 		}
 
@@ -351,6 +463,12 @@ func (m model) fetchDashboardData() tea.Msg {
 }
 
 func (m model) fetchData() tea.Msg {
+	defer func() {
+		if r := recover(); r != nil {
+			m.err = fmt.Errorf("panic durante coleta SNMP: %v", r)
+		}
+	}()
+
 	// Conectar ao switch
 	if err := m.snmp.Connect(); err != nil {
 		return err
@@ -360,13 +478,13 @@ func (m model) fetchData() tea.Msg {
 	// Obter nome do sistema
 	result, err := m.snmp.Get([]string{oidSysName})
 	if err == nil && len(result.Variables) > 0 {
-		m.sysName = string(result.Variables[0].Value.([]byte))
+		m.sysName = toString(result.Variables[0].Value)
 	}
 
 	// Obter uptime
 	result, err = m.snmp.Get([]string{oidSysUpTime})
 	if err == nil && len(result.Variables) > 0 {
-		ticks := result.Variables[0].Value.(uint32)
+		ticks := toUint32(result.Variables[0].Value)
 		m.uptime = formatUptime(ticks)
 	}
 
@@ -393,7 +511,7 @@ func (m model) getInterfacesForSwitch(snmp *gosnmp.GoSNMP) []int {
 
 	err := snmp.Walk(oidIfIndex, func(pdu gosnmp.SnmpPDU) error {
 		if pdu.Value != nil {
-			allInterfaces = append(allInterfaces, pdu.Value.(int))
+			allInterfaces = append(allInterfaces, toInt(pdu.Value))
 		}
 		return nil
 	})
@@ -416,8 +534,8 @@ func (m model) getInterfacesForSwitch(snmp *gosnmp.GoSNMP) []int {
 		}
 		result, err := snmp.Get(oids)
 		if err == nil && len(result.Variables) == 2 {
-			ifType := result.Variables[0].Value.(int)
-			ifAdminStatus := result.Variables[1].Value.(int)
+			ifType := toInt(result.Variables[0].Value)
+			ifAdminStatus := toInt(result.Variables[1].Value)
 
 			if allowedTypes[ifType] && ifAdminStatus == 1 {
 				filteredInterfaces = append(filteredInterfaces, ifIndex)
@@ -461,54 +579,47 @@ func (m model) getInterfaceStatsForSwitch(snmp *gosnmp.GoSNMP, ifIndex int) Inte
 		switch i {
 		case 0:
 			if variable.Value != nil {
-				stat.Description = string(variable.Value.([]byte))
+				stat.Description = toString(variable.Value)
 			}
 		case 1:
 			if variable.Value != nil {
-				stat.Name = string(variable.Value.([]byte))
+				stat.Name = toString(variable.Value)
 			}
 		case 2:
 			if variable.Value != nil {
-				switch v := variable.Value.(type) {
-				case []byte:
-					if len(v) > 0 {
-						stat.Alias = string(v)
-					}
-				case string:
-					stat.Alias = v
-				}
+				stat.Alias = toString(variable.Value)
 			}
 		case 3:
 			if variable.Value != nil {
-				stat.Type = variable.Value.(int)
+				stat.Type = toInt(variable.Value)
 			}
 		case 4:
 			if variable.Value != nil {
-				stat.Speed = uint64(variable.Value.(uint))
+				stat.Speed = toUint64(variable.Value)
 			}
 		case 5:
 			if variable.Value != nil {
-				stat.InOctets = variable.Value.(uint64)
+				stat.InOctets = toUint64(variable.Value)
 			}
 		case 6:
 			if variable.Value != nil {
-				stat.OutOctets = variable.Value.(uint64)
+				stat.OutOctets = toUint64(variable.Value)
 			}
 		case 7:
 			if variable.Value != nil {
-				stat.InErrors = uint64(variable.Value.(uint))
+				stat.InErrors = toUint64(variable.Value)
 			}
 		case 8:
 			if variable.Value != nil {
-				stat.OutErrors = uint64(variable.Value.(uint))
+				stat.OutErrors = toUint64(variable.Value)
 			}
 		case 9:
 			if variable.Value != nil {
-				stat.AdminStatus = variable.Value.(int)
+				stat.AdminStatus = toInt(variable.Value)
 			}
 		case 10:
 			if variable.Value != nil {
-				stat.OperStatus = variable.Value.(int)
+				stat.OperStatus = toInt(variable.Value)
 			}
 		}
 	}
@@ -523,6 +634,7 @@ func (m model) getInterfaceStats(ifIndex int) InterfaceStats {
 func (m *model) calculateMetrics() []InterfaceMetrics {
 	var metrics []InterfaceMetrics
 	m.alerts = []string{}
+	historyChanged := false
 
 	var indices []int
 	for ifIndex := range m.currentStats {
@@ -549,18 +661,18 @@ func (m *model) calculateMetrics() []InterfaceMetrics {
 		if prev, ok := m.prevStats[ifIndex]; ok {
 			timeDiff := current.Timestamp.Sub(prev.Timestamp).Seconds()
 			if timeDiff > 0 {
-				rxBytes := float64(current.InOctets - prev.InOctets)
+				rxBytes := float64(counterDelta(current.InOctets, prev.InOctets))
 				rxRate := (rxBytes * 8) / timeDiff
 				metric.RxRate = formatBps(rxRate)
 				metric.RxRateBps = rxRate
 
-				txBytes := float64(current.OutOctets - prev.OutOctets)
+				txBytes := float64(counterDelta(current.OutOctets, prev.OutOctets))
 				txRate := (txBytes * 8) / timeDiff
 				metric.TxRate = formatBps(txRate)
 				metric.TxRateBps = txRate
 
-				inErr := float64(current.InErrors - prev.InErrors)
-				outErr := float64(current.OutErrors - prev.OutErrors)
+				inErr := float64(counterDelta(current.InErrors, prev.InErrors))
+				outErr := float64(counterDelta(current.OutErrors, prev.OutErrors))
 				errorRate := (inErr + outErr) / timeDiff
 				metric.ErrorRate = fmt.Sprintf("%.2f", errorRate)
 
@@ -587,22 +699,25 @@ func (m *model) calculateMetrics() []InterfaceMetrics {
 				}
 
 				// Adicionar ao histórico se esta interface está selecionada e estamos na view de gráfico
-				if m.currentView == ViewGraph && ifIndex == m.selectedIfIndex {
-					m.history = append(m.history, DataPoint{
-						Timestamp: time.Now(),
-						RxRate:    rxRate,
-						TxRate:    txRate,
-					})
-
-					// Manter apenas maxHistory pontos
-					if len(m.history) > m.maxHistory {
-						m.history = m.history[len(m.history)-m.maxHistory:]
-					}
-				}
+				point := DataPoint{Timestamp: time.Now(), RxRate: rxRate, TxRate: txRate}
+				history := append(m.historyByIf[ifIndex], point)
+				m.historyByIf[ifIndex] = pruneHistory(history, time.Now().Add(-m.historyTTL))
+				historyChanged = true
 			}
 		}
 
 		metrics = append(metrics, metric)
+	}
+
+	if historyChanged {
+		m.persistCurrentHostHistory()
+	}
+
+	if m.currentView == ViewGraph {
+		m.history = append([]DataPoint(nil), m.historyByIf[m.selectedIfIndex]...)
+		if len(m.history) > m.maxHistory {
+			m.history = m.history[len(m.history)-m.maxHistory:]
+		}
 	}
 
 	return metrics
@@ -665,7 +780,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if selectedIdx < len(metrics) {
 					m.selectedIfIndex = metrics[selectedIdx].Index
 					m.currentView = ViewGraph
-					m.history = []DataPoint{} // Iniciar novo histórico
+					m.history = append([]DataPoint(nil), m.historyByIf[m.selectedIfIndex]...)
+					if len(m.history) > m.maxHistory {
+						m.history = m.history[len(m.history)-m.maxHistory:]
+					}
 					return m, nil
 				}
 			}
@@ -902,8 +1020,18 @@ func (m model) renderGraph(speedMbps uint64) string {
 	const height = 20
 	const width = 100
 
-	// Calcular escala baseada na velocidade da porta
-	maxRate := float64(speedMbps) * 1000000 // Mbps para bps
+	// Escala dinâmica com margem visual para lembrar o estilo do btop.
+	interfaceLimit := float64(speedMbps) * 1000000 // Mbps para bps
+	if interfaceLimit <= 0 {
+		interfaceLimit = 1000000
+	}
+
+	peak := 0.0
+	for _, p := range m.history {
+		peak = math.Max(peak, math.Max(p.RxRate, p.TxRate))
+	}
+	maxRate := math.Max(interfaceLimit*0.05, peak*1.20)
+	maxRate = math.Min(maxRate, interfaceLimit)
 
 	// Criar grid
 	grid := make([][]rune, height)
@@ -922,26 +1050,32 @@ func (m model) renderGraph(speedMbps uint64) string {
 
 	startIdx := len(m.history) - pointsToShow
 
+	rxSeries := make([]float64, pointsToShow)
+	txSeries := make([]float64, pointsToShow)
 	for i := 0; i < pointsToShow; i++ {
 		point := m.history[startIdx+i]
-		x := i
+		rxSeries[i] = point.RxRate
+		txSeries[i] = point.TxRate
+	}
 
-		// RX (azul)
-		rxPercent := point.RxRate / maxRate
-		rxY := height - 1 - int(rxPercent*float64(height-1))
-		if rxY >= 0 && rxY < height && x < width {
-			grid[rxY][x] = '█'
-		}
+	rxSeries = smoothSeries(rxSeries, 0.35)
+	txSeries = smoothSeries(txSeries, 0.35)
 
-		// TX (vermelho) - ligeiramente offset
-		txPercent := point.TxRate / maxRate
-		txY := height - 1 - int(txPercent*float64(height-1))
-		if txY >= 0 && txY < height && x < width {
-			if grid[txY][x] == '█' {
-				grid[txY][x] = '▓' // Ambos
-			} else {
-				grid[txY][x] = '▒' // TX
-			}
+	half := height / 2
+	for x := 0; x < pointsToShow; x++ {
+		rxValue := math.Max(rxSeries[x], 0)
+		txValue := math.Max(txSeries[x], 0)
+
+		rxUnits := int(math.Round((rxValue / maxRate) * float64(half*8)))
+		txUnits := int(math.Round((txValue / maxRate) * float64(half*8)))
+
+		drawBar(grid, x, half-1, -1, rxUnits, 'R')
+		drawBar(grid, x, half, 1, txUnits, 'T')
+	}
+
+	for x := 0; x < width; x++ {
+		if grid[half][x] == ' ' {
+			grid[half][x] = '─'
 		}
 	}
 
@@ -964,9 +1098,9 @@ func (m model) renderGraph(speedMbps uint64) string {
 		// Colorir linha
 		line := string(grid[i])
 		// RX = azul, TX = vermelho, ambos = magenta
-		line = strings.ReplaceAll(line, "█", lipgloss.NewStyle().Foreground(lipgloss.Color("#0000FF")).Render("█"))
-		line = strings.ReplaceAll(line, "▒", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("▒"))
-		line = strings.ReplaceAll(line, "▓", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF00FF")).Render("▓"))
+		line = strings.ReplaceAll(line, "R", lipgloss.NewStyle().Foreground(lipgloss.Color("#3BA1FF")).Render("█"))
+		line = strings.ReplaceAll(line, "T", lipgloss.NewStyle().Foreground(lipgloss.Color("#D34BFF")).Render("█"))
+		line = strings.ReplaceAll(line, "─", lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")).Render("─"))
 
 		output.WriteString(line)
 		output.WriteString("│\n")
@@ -984,6 +1118,25 @@ func (m model) renderGraph(speedMbps uint64) string {
 	output.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("agora →"))
 
 	return output.String()
+}
+
+func drawBar(grid [][]rune, x int, startRow int, direction int, units int, marker rune) {
+	if len(grid) == 0 || x < 0 || x >= len(grid[0]) || units <= 0 {
+		return
+	}
+
+	height := len(grid)
+	filled := units
+	for step := 0; filled > 0; step++ {
+		row := startRow + (step * direction)
+		if row < 0 || row >= height {
+			break
+		}
+		if filled > 0 {
+			grid[row][x] = marker
+		}
+		filled -= 8
+	}
 }
 
 // Funções auxiliares
@@ -1058,8 +1211,133 @@ func truncateString(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
+func smoothSeries(series []float64, alpha float64) []float64 {
+	if len(series) == 0 {
+		return series
+	}
+	out := make([]float64, len(series))
+	out[0] = series[0]
+	for i := 1; i < len(series); i++ {
+		out[i] = alpha*series[i] + (1-alpha)*out[i-1]
+	}
+	return out
+}
+
+func drawSeriesLine(grid [][]rune, x0 int, y0Value float64, x1 int, y1Value float64, maxRate float64, symbol rune) {
+	height := len(grid)
+	if height == 0 {
+		return
+	}
+	width := len(grid[0])
+	y0 := rateToY(y0Value, maxRate, height)
+	y1 := rateToY(y1Value, maxRate, height)
+	dx := x1 - x0
+	if dx <= 0 {
+		setGraphPoint(grid, x0, y0, symbol, width, height)
+		return
+	}
+
+	for step := 0; step <= dx; step++ {
+		t := float64(step) / float64(dx)
+		x := x0 + step
+		y := int(math.Round(float64(y0) + t*float64(y1-y0)))
+		setGraphPoint(grid, x, y, symbol, width, height)
+	}
+}
+
+func setGraphPoint(grid [][]rune, x, y int, symbol rune, width, height int) {
+	if x < 0 || x >= width || y < 0 || y >= height {
+		return
+	}
+	if grid[y][x] != ' ' && grid[y][x] != symbol {
+		grid[y][x] = '▓'
+		return
+	}
+	grid[y][x] = symbol
+}
+
+func rateToY(rate, maxRate float64, height int) int {
+	if maxRate <= 0 {
+		return height - 1
+	}
+	if rate < 0 {
+		rate = 0
+	}
+	percent := math.Min(rate/maxRate, 1)
+	return height - 1 - int(percent*float64(height-1))
+}
+
+func toBigInt(value interface{}) *big.Int {
+	if value == nil {
+		return big.NewInt(0)
+	}
+	if v := gosnmp.ToBigInt(value); v != nil {
+		return v
+	}
+	return big.NewInt(0)
+}
+
+func toUint64(value interface{}) uint64 {
+	v := toBigInt(value)
+	if v.Sign() < 0 {
+		return 0
+	}
+	return v.Uint64()
+}
+
+func toUint32(value interface{}) uint32 {
+	return uint32(toUint64(value))
+}
+
+func toInt(value interface{}) int {
+	return int(toUint64(value))
+}
+
+func toString(value interface{}) string {
+	switch v := value.(type) {
+	case []byte:
+		return string(v)
+	case string:
+		return v
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func counterDelta(current, previous uint64) uint64 {
+	if current >= previous {
+		return current - previous
+	}
+	return 0
+}
+
+func promptForTarget(reader *bufio.Reader) (string, string, error) {
+	fmt.Print("Host/IP do switch: ")
+	host, err := reader.ReadString('\n')
+	if err != nil {
+		return "", "", err
+	}
+
+	fmt.Print("Community SNMP: ")
+	community, err := reader.ReadString('\n')
+	if err != nil {
+		return "", "", err
+	}
+
+	host = strings.TrimSpace(host)
+	community = strings.TrimSpace(community)
+
+	if host == "" || community == "" {
+		return "", "", fmt.Errorf("host e community são obrigatórios")
+	}
+
+	return host, community, nil
+}
+
 func main() {
 	dashboardMode := flag.Bool("d", false, "Dashboard mode - load switches from switches.json")
+	hostFlag := flag.String("host", "", "Host/IP do switch")
+	communityFlag := flag.String("community", "", "Community SNMP")
 	flag.Parse()
 
 	var m model
@@ -1067,19 +1345,18 @@ func main() {
 	if *dashboardMode {
 		m = initialModel(true, "", "")
 	} else {
-		if len(os.Args) < 3 {
-			fmt.Println("Uso:")
-			fmt.Println("  Modo normal:    switch-monitor <host> <community>")
-			fmt.Println("  Modo dashboard: switch-monitor -d")
-			fmt.Println("")
-			fmt.Println("Exemplos:")
-			fmt.Println("  switch-monitor 192.168.1.1 public")
-			fmt.Println("  switch-monitor -d")
-			os.Exit(1)
-		}
+		host := strings.TrimSpace(*hostFlag)
+		community := strings.TrimSpace(*communityFlag)
 
-		host := os.Args[1]
-		community := os.Args[2]
+		if host == "" || community == "" {
+			reader := bufio.NewReader(os.Stdin)
+			var err error
+			host, community, err = promptForTarget(reader)
+			if err != nil {
+				fmt.Printf("Erro ao ler host/community: %v\n", err)
+				os.Exit(1)
+			}
+		}
 		m = initialModel(false, host, community)
 	}
 
